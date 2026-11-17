@@ -8,7 +8,11 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(mess
 
 if __name__ == "__main__":
     while True:
-        code = run()
+        try:
+            code = run()
+        except Exception:  # noqa: BLE001
+            logging.getLogger("resident_addon").exception("unexpected error; restarting")
+            code = 1
         if code in (2, 3, 4):
             logging.getLogger("resident_addon").error("stopped (code %s)", code)
             sys.exit(code)

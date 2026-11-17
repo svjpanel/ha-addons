@@ -16,9 +16,11 @@ MAX_NAME = 64
 MIN_INTERVAL_S = 5.0
 SENSITIVE_MIN_INTERVAL_S = 60.0
 KEEP_ATTRS = ("unit_of_measurement", "device_class", "friendly_name")
-PRIVACY_CLASSES = frozenset({
-    "motion", "occupancy", "presence", "door", "window", "opening", "garage_door",
-    "power", "energy", "current", "illuminance", "co2", "humidity",
+SAFE_CLASSES = frozenset({
+    "temperature", "battery", "pressure", "atmospheric_pressure", "voltage", "signal_strength",
+    "timestamp", "date", "duration", "aqi", "pm1", "pm10", "pm25", "precipitation",
+    "precipitation_intensity", "wind_speed", "irradiance", "uv_index", "enum", "connectivity",
+    "problem", "battery_charging", "plug", "running", "update", "heat", "cold", "light",
 })
 AUDIO_CLASSES = frozenset({"sound", "sound_pressure"})
 LOCATION_ATTRS = frozenset({"latitude", "longitude", "gps_accuracy"})
@@ -35,6 +37,10 @@ DC_OK = re.compile(r"[a-z_]{1,40}")
 NAME_BAD = re.compile(r"[<>\x00-\x1f\x7f]")
 
 
+def is_sensitive_class(device_class: Any) -> bool:
+    return isinstance(device_class, str) and device_class not in SAFE_CLASSES
+
+
 @dataclass(frozen=True)
 class ReadGrant:
     entity_id: str
@@ -46,7 +52,7 @@ def parse_reads(raw: list[dict[str, Any]]) -> dict[str, ReadGrant]:
     out: dict[str, ReadGrant] = {}
     for item in (raw or [])[:MAX_ENTITIES]:
         eid = str(item.get("entity_id", ""))
-        if not ENTITY_RE.match(eid):
+        if not ENTITY_RE.fullmatch(eid):
             continue
         domain = eid.split(".", 1)[0]
         if domain in DENY_DOMAINS or domain not in READ_DOMAINS:
@@ -81,7 +87,7 @@ def allowlist_entries(reads: dict[str, ReadGrant], grants: dict, states: list[di
         attrs = (by_id.get(eid) or {}).get("attributes") or {}
         dc, unit = attrs.get("device_class"), attrs.get("unit_of_measurement")
         read = reads.get(eid)
-        if dc in AUDIO_CLASSES or (dc in PRIVACY_CLASSES and not (read and read.sensitive_ack)):
+        if dc in AUDIO_CLASSES or (is_sensitive_class(dc) and not (read and read.sensitive_ack)):
             continue
         services = sorted(g.service.split(".", 1)[1] for (e, _), g in grants.items() if e == eid)
         name = _clean_name(attrs.get("friendly_name"))
@@ -118,7 +124,7 @@ def project(state: dict[str, Any], grant: ReadGrant | None) -> dict[str, Any] | 
     device_class = attrs.get("device_class")
     if device_class in AUDIO_CLASSES:
         return None
-    if device_class in PRIVACY_CLASSES and not grant.sensitive_ack:
+    if is_sensitive_class(device_class) and not grant.sensitive_ack:
         return None
     value = state.get("state")
     if not isinstance(value, str):
@@ -132,7 +138,7 @@ def project(state: dict[str, Any], grant: ReadGrant | None) -> dict[str, Any] | 
         out["unit_of_measurement"] = unit
     if isinstance(device_class, str) and len(device_class) <= 32 and not NAME_BAD.search(device_class):
         out["device_class"] = device_class
-        if device_class in PRIVACY_CLASSES:
+        if is_sensitive_class(device_class):
             out["privacy_sensitive"] = True
     name = _clean_name(attrs.get("friendly_name"))
     if name:

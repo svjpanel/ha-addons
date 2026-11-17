@@ -10,20 +10,23 @@ from pathlib import Path
 from typing import Any
 
 from . import keystore
-from .client import Conflict, GatewayClient, Killed, PairRejected, Revoked, TransientError
+from .client import MAX_POLL_S, MIN_POLL_S, Conflict, GatewayClient, Killed, PairRejected, Revoked, TransientError
 from .ha_api import HAApi
 from .policy import Dedupe, Rejected, build_call, parse_actions, ttl_of
 from .state import Reporter, allowlist_entries, parse_reads, state_body
 
 log = logging.getLogger("resident_addon")
-CMD_ID_RE = re.compile(r"^[A-Za-z0-9_-]{8,64}$")
+CMD_ID_RE = re.compile(r"[A-Za-z0-9_-]{8,64}")
 ROTATE_BEFORE = timedelta(days=14)
+SAVE_ATTEMPTS = 3
+SAVE_RETRY_S = 1.0
+_pending_save: list[tuple[str, str | None, str]] = []
+ROTATE_MIN_GAP_S = 3600.0
+_last_rotate = [-ROTATE_MIN_GAP_S]
 HEARTBEAT_S = 300
 STATE_TICK_S = 5
 IDLE_POLL_S = 60
 IDLE_JITTER_S = 10
-MIN_POLL_S = 10
-MAX_POLL_S = 300
 FAST_WAIT_S = 25
 FAST_MIN_INTERVAL_S = 1.0
 CONFIRM_CODE_RE = re.compile(r"^\d{4}$")
@@ -51,7 +54,7 @@ def execute_command(cmd: dict[str, Any], grants, ha: HAApi, dedupe: Dedupe, rece
                     clock=time.monotonic, persist=None) -> tuple[bool, str | None]:
     """Returns (ok, error). Never raises on bad input; duplicates return (True, 'duplicate')."""
     cmd_id = cmd.get("cmd_id")
-    if not isinstance(cmd_id, str) or not CMD_ID_RE.match(cmd_id):
+    if not isinstance(cmd_id, str) or not CMD_ID_RE.fullmatch(cmd_id):
         return False, "bad cmd_id"
     if dedupe.seen(cmd_id):
         return True, "duplicate"
@@ -61,9 +64,15 @@ def execute_command(cmd: dict[str, Any], grants, ha: HAApi, dedupe: Dedupe, rece
     except Rejected as exc:
         dedupe.add(cmd_id)
         return False, f"rejected: {exc}"
+    except Exception:  # noqa: BLE001
+        dedupe.add(cmd_id)
+        return False, "rejected: internal"
     dedupe.add(cmd_id)
     if persist:
-        persist()
+        try:
+            persist()
+        except OSError:
+            log.warning("could not persist dedupe state")
     if clock() - received_at > ttl:
         return False, "expired"
     try:
@@ -83,13 +92,32 @@ def _parse_ts(value: str | None) -> datetime | None:
 
 
 def maybe_rotate(client: GatewayClient, record: dict[str, Any], now: datetime | None = None) -> None:
+    if _pending_save and _try_save(*_pending_save[0]):
+        _pending_save.clear()
     exp = _parse_ts(record.get("expires_at"))
     now = now or datetime.now(timezone.utc)
     if exp is None or exp - now > ROTATE_BEFORE:
         return
+    if time.monotonic() - _last_rotate[0] < ROTATE_MIN_GAP_S:
+        return
+    _last_rotate[0] = time.monotonic()
     res = client.rotate()
-    keystore.save_key(res["key"], res.get("expires_at"), record["install_id"])
     client.set_key(res["key"])
+    args = (res["key"], res.get("expires_at"), record["install_id"])
+    if not _try_save(*args):
+        _pending_save[:] = [args]
+
+
+def _try_save(key: str, expires_at: str | None, install_id: str) -> bool:
+    for attempt in range(SAVE_ATTEMPTS):
+        try:
+            keystore.save_key(key, expires_at, install_id)
+            return True
+        except OSError as e:
+            log.error("save_key failed after rotate (attempt %d/%d): %s", attempt + 1, SAVE_ATTEMPTS, e)
+            if attempt + 1 < SAVE_ATTEMPTS:
+                time.sleep(SAVE_RETRY_S)
+    return False
 
 
 def run(options: dict[str, Any] | None = None, ha: HAApi | None = None) -> int:
@@ -164,7 +192,7 @@ def run(options: dict[str, Any] | None = None, ha: HAApi | None = None) -> int:
                 if err == "duplicate":
                     continue
                 cid = cmd.get("cmd_id")
-                if isinstance(cid, str) and CMD_ID_RE.match(cid):
+                if isinstance(cid, str) and CMD_ID_RE.fullmatch(cid):
                     client.post_result(cid, ok, err)
     except Revoked:
         keystore.delete_key()

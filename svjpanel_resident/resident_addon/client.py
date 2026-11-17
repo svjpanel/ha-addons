@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 import json
+import math
+import re
 import time
 import urllib.error
 import urllib.request
@@ -13,6 +15,8 @@ GATEWAY_URL = "https://ha-gateway.svjpanel.cz"
 MAX_BODY = 1_000_000
 TOKEN_MARGIN_S = 120
 DEFAULT_TOKEN_TTL_S = 600
+MIN_POLL_S = 10
+MAX_POLL_S = 300
 
 
 class Poll(NamedTuple):
@@ -47,6 +51,8 @@ class _NoRedirect(urllib.request.HTTPRedirectHandler):
 
 
 REVOKE_CODES = frozenset({"key", "token"})
+LINK_STATUS_CODES = frozenset({"quarantined", "idle_revoked"})
+_CMD_ID_RE = re.compile(r"[A-Za-z0-9_-]{8,64}")
 
 
 def _error_code(exc: urllib.error.HTTPError) -> str | None:
@@ -121,6 +127,8 @@ class GatewayClient:
             code = _error_code(exc)
             if exc.code == 401 and code in REVOKE_CODES:
                 raise Revoked() from None
+            if exc.code in (401, 403, 410) and code in LINK_STATUS_CODES:
+                raise Revoked() from None
             if exc.code == 403 and code == "revoked":
                 raise Revoked() from None
             if path == "/v1/pair" and (exc.code == 401 or (exc.code == 429 and code == "pair_locked")):
@@ -175,13 +183,18 @@ class GatewayClient:
             cmds, mode, nxt = [], "idle", None
         if not isinstance(cmds, list):
             cmds = []
-        nxt = float(nxt) if isinstance(nxt, (int, float)) and not isinstance(nxt, bool) and nxt > 0 else None
+        if isinstance(nxt, (int, float)) and not isinstance(nxt, bool) and math.isfinite(nxt) and nxt > 0:
+            nxt = min(max(float(nxt), MIN_POLL_S), MAX_POLL_S)
+        else:
+            nxt = None
         return Poll([c for c in cmds if isinstance(c, dict)], mode == "fast", nxt)
 
     def poll_commands(self, wait: int = 25) -> list[dict[str, Any]]:
         return self.poll(wait).commands
 
     def post_result(self, cmd_id: str, ok: bool, error: str | None = None) -> None:
+        if not _CMD_ID_RE.fullmatch(cmd_id):
+            raise ValueError("bad cmd_id")
         body: dict[str, Any] = {"ok": ok}
         if error:
             body["error"] = error

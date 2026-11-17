@@ -1,6 +1,6 @@
 """Command policy: the add-on builds every HA call itself."""
 from __future__ import annotations
-
+import math
 import re
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -14,6 +14,7 @@ DENY_DOMAINS = frozenset({
 READ_DOMAINS = frozenset({"sensor", "binary_sensor", "climate", "weather"})
 TRIGGERS_OTHERS = frozenset({"script", "scene", "switch", "input_boolean"})
 
+MAX_ACTIONS = 200
 ENTITY_RE = re.compile(r"^[a-z_]+\.[a-z0-9_]{1,100}$")
 FORBIDDEN_KEYS = frozenset({"entity_id", "device_id", "area_id", "label_id", "floor_id", "target"})
 TEMPLATE_MARKERS = ("{{", "{%", "{#")
@@ -28,7 +29,7 @@ class Rejected(Exception):
 
 def _int_range(lo: int, hi: int) -> Callable[[Any], int]:
     def check(v: Any) -> int:
-        if isinstance(v, bool) or not isinstance(v, int | float) or v != int(v):
+        if isinstance(v, bool) or not isinstance(v, int | float) or not math.isfinite(v) or v != int(v):
             raise Rejected("expected integer")
         return max(lo, min(hi, int(v)))
     return check
@@ -36,7 +37,7 @@ def _int_range(lo: int, hi: int) -> Callable[[Any], int]:
 
 def _clamped_float(lo: float, hi: float) -> Callable[[Any], float]:
     def check(v: Any) -> float:
-        if isinstance(v, bool) or not isinstance(v, int | float) or v != v:
+        if isinstance(v, bool) or not isinstance(v, int | float) or not math.isfinite(v):
             raise Rejected("expected number")
         return max(lo, min(hi, float(v)))
     return check
@@ -69,7 +70,7 @@ class ActionGrant:
 
 def parse_actions(raw: list[dict[str, Any]]) -> dict[tuple[str, str], ActionGrant]:
     grants: dict[tuple[str, str], ActionGrant] = {}
-    for item in raw or []:
+    for item in (raw or [])[:MAX_ACTIONS]:
         entity_id = str(item.get("entity_id", ""))
         service = str(item.get("service", ""))
         if not ENTITY_RE.fullmatch(entity_id) or service.count(".") != 1:
@@ -135,7 +136,7 @@ def build_call(cmd: dict[str, Any], grants: dict[tuple[str, str], ActionGrant]) 
 
 def ttl_of(cmd: dict[str, Any]) -> float:
     ttl = cmd.get("ttl_s")
-    if isinstance(ttl, bool) or not isinstance(ttl, int | float) or ttl <= 0:
+    if isinstance(ttl, bool) or not isinstance(ttl, int | float) or not math.isfinite(ttl) or ttl <= 0:
         raise Rejected("bad ttl_s")
     return min(float(ttl), MAX_TTL_S)
 
