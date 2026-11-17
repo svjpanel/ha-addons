@@ -1,0 +1,143 @@
+name: release
+
+# Builds the resident add-on image per architecture from a version tag that sits on main, pushes it to GHCR,
+# records the per-arch digests in release-digests.json and publishes them in the release notes.
+# Tags are never reused: an existing image tag fails the build job before the push, a recorded version fails
+# the record job. Digests are published as the release asset release-digests.json (no push to protected main).
+
+on:
+  push:
+    tags:
+      - "v[0-9]+.[0-9]+.[0-9]+"
+
+permissions: {}
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+env:
+  IMAGE_PREFIX: ghcr.io/svjpanel/svjpanel-resident
+
+jobs:
+  verify:
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    outputs:
+      version: ${{ steps.v.outputs.version }}
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - id: v
+        run: |
+          set -eu
+          version="${GITHUB_REF_NAME#v}"
+          cfg="$(sed -n 's/^version: "\(.*\)"$/\1/p' svjpanel_resident/config.yaml)"
+          test "$version" = "$cfg"
+          git merge-base --is-ancestor "$GITHUB_SHA" origin/main
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+  build-aarch64:
+    needs: verify
+    runs-on: ubuntu-24.04-arm
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      digest: ${{ steps.b.outputs.digest }}
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      - id: b
+        env:
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION: ${{ needs.verify.outputs.version }}
+        run: |
+          set -eu
+          arch=aarch64
+          echo "$GHCR_TOKEN" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
+          if out="$(docker buildx imagetools inspect "$IMAGE_PREFIX-$arch:$VERSION" 2>&1)"; then
+            echo "image tag $IMAGE_PREFIX-$arch:$VERSION already exists" >&2
+            exit 1
+          fi
+          case "$out" in
+            *"not found"*|*"NAME_UNKNOWN"*|*"MANIFEST_UNKNOWN"*) ;;
+            *) echo "cannot verify image tag absence: $out" >&2; exit 1 ;;
+          esac
+          base="$(awk '$1 == "'"$arch"':" {print $2}' svjpanel_resident/build.yaml)"
+          test -n "$base"
+          docker buildx build --platform linux/arm64 --build-arg "BUILD_FROM=$base" \
+            --tag "$IMAGE_PREFIX-$arch:$VERSION" --push --metadata-file meta.json svjpanel_resident
+          digest="$(jq -r '."containerimage.digest"' meta.json)"
+          registry="$(docker buildx imagetools inspect "$IMAGE_PREFIX-$arch:$VERSION" --format '{{json .Manifest.Digest}}' | tr -d '"')"
+          test -n "$digest"
+          test "$digest" = "$registry"
+          echo "digest=$digest" >> "$GITHUB_OUTPUT"
+
+  build-amd64:
+    needs: verify
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      digest: ${{ steps.b.outputs.digest }}
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      - id: b
+        env:
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION: ${{ needs.verify.outputs.version }}
+        run: |
+          set -eu
+          arch=amd64
+          echo "$GHCR_TOKEN" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
+          if out="$(docker buildx imagetools inspect "$IMAGE_PREFIX-$arch:$VERSION" 2>&1)"; then
+            echo "image tag $IMAGE_PREFIX-$arch:$VERSION already exists" >&2
+            exit 1
+          fi
+          case "$out" in
+            *"not found"*|*"NAME_UNKNOWN"*|*"MANIFEST_UNKNOWN"*) ;;
+            *) echo "cannot verify image tag absence: $out" >&2; exit 1 ;;
+          esac
+          base="$(awk '$1 == "'"$arch"':" {print $2}' svjpanel_resident/build.yaml)"
+          test -n "$base"
+          docker buildx build --platform linux/amd64 --build-arg "BUILD_FROM=$base" \
+            --tag "$IMAGE_PREFIX-$arch:$VERSION" --push --metadata-file meta.json svjpanel_resident
+          digest="$(jq -r '."containerimage.digest"' meta.json)"
+          registry="$(docker buildx imagetools inspect "$IMAGE_PREFIX-$arch:$VERSION" --format '{{json .Manifest.Digest}}' | tr -d '"')"
+          test -n "$digest"
+          test "$digest" = "$registry"
+          echo "digest=$digest" >> "$GITHUB_OUTPUT"
+
+  record:
+    needs: [verify, build-aarch64, build-amd64]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - env:
+          VERSION: ${{ needs.verify.outputs.version }}
+          D_AARCH64: ${{ needs.build-aarch64.outputs.digest }}
+          D_AMD64: ${{ needs.build-amd64.outputs.digest }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -eu
+          prev="$(gh release list --limit 1 --json tagName --jq '.[0].tagName // empty')"
+          if [ -n "$prev" ]; then
+            gh release download "$prev" --pattern release-digests.json || rm -f release-digests.json
+          fi
+          python3 svjpanel_resident/resident_addon/record_digest.py release-digests.json "$VERSION" \
+            "aarch64=$D_AARCH64" "amd64=$D_AMD64"
+          printf 'Image digests (immutable):\n\n- aarch64: `%s`\n- amd64: `%s`\n' "$D_AARCH64" "$D_AMD64" > notes.md
+          gh release create "v$VERSION" --title "v$VERSION" --notes-file notes.md release-digests.json

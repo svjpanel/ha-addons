@@ -183,8 +183,10 @@ class GatewayClient:
             cmds, mode, nxt = [], "idle", None
         if not isinstance(cmds, list):
             cmds = []
-        if isinstance(nxt, (int, float)) and not isinstance(nxt, bool) and math.isfinite(nxt) and nxt > 0:
-            nxt = min(max(float(nxt), MIN_POLL_S), MAX_POLL_S)
+        if isinstance(nxt, int) and not isinstance(nxt, bool):
+            nxt = float(min(nxt, MAX_POLL_S)) if nxt > 0 else None
+        if isinstance(nxt, float) and math.isfinite(nxt) and nxt > 0:
+            nxt = min(max(nxt, MIN_POLL_S), MAX_POLL_S)
         else:
             nxt = None
         return Poll([c for c in cmds if isinstance(c, dict)], mode == "fast", nxt)
